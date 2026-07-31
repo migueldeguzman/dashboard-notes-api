@@ -7,6 +7,8 @@ const http = require('http');
 const crypto = require('crypto');
 const fs = require('fs');
 const { execFileSync } = require('child_process');
+const { S3Client, PutObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
+const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 
 const PORT = process.env.PORT || 10000;
 const USERS = JSON.parse(process.env.USERS_JSON || '[]');
@@ -109,6 +111,35 @@ function readBody(req, maxBytes = 100000) {
 
 const VALID_STATUS = ['open', 'done', 'deployed'];
 
+// Image attachments: stored in the platform's private S3 bucket, viewed via
+// short-lived presigned URLs so access stays gated by dashboard login.
+const S3_BUCKET = process.env.AWS_S3_BUCKET || '';
+const S3_PREFIX = 'ceo-dashboard/';
+const S3_URL_TTL = 3600;
+const IMAGE_MAX_BYTES = 8 * 1024 * 1024;
+const IMAGE_TYPES = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/gif': 'gif', 'image/webp': 'webp' };
+const s3 = S3_BUCKET ? new S3Client({ region: process.env.AWS_S3_REGION || 'us-east-1' }) : null;
+
+function sanitizeImageKeys(images) {
+  if (!Array.isArray(images)) return [];
+  return images
+    .filter(k => typeof k === 'string' && k.startsWith(S3_PREFIX) && /^[A-Za-z0-9/_.-]+$/.test(k))
+    .slice(0, 6);
+}
+
+async function presignImages(notes) {
+  if (!s3) return notes;
+  const sign = key => getSignedUrl(s3, new GetObjectCommand({ Bucket: S3_BUCKET, Key: key }), { expiresIn: S3_URL_TTL });
+  return Promise.all(notes.map(async n => ({
+    ...n,
+    image_urls: await Promise.all((n.images || []).map(sign)),
+    replies: await Promise.all((n.replies || []).map(async r => ({
+      ...r,
+      image_urls: await Promise.all((r.images || []).map(sign)),
+    }))),
+  })));
+}
+
 // Live feed pass-through: the workstation publisher POSTs the encrypted
 // envelope here; the dashboard GETs it with zero CDN caching. The envelope is
 // ciphertext, so the GET can be public (same data as the public git branch).
@@ -182,16 +213,32 @@ const server = http.createServer(async (req, res) => {
     if (!auth) return json(res, 401, { error: 'unauthorized' }, origin);
 
     if (req.method === 'GET' && url.pathname === '/notes') {
-      return json(res, 200, { notes: readNotes() }, origin);
+      return json(res, 200, { notes: await presignImages(readNotes()) }, origin);
+    }
+
+    if (req.method === 'POST' && url.pathname === '/images') {
+      if (!s3) return json(res, 503, { error: 'image storage not configured' }, origin);
+      const { name, type, data } = await readBody(req, Math.ceil(IMAGE_MAX_BYTES * 1.4));
+      const ext = IMAGE_TYPES[type];
+      if (!ext) return json(res, 400, { error: 'unsupported image type' }, origin);
+      let buf;
+      try { buf = Buffer.from(String(data || ''), 'base64'); } catch { buf = null; }
+      if (!buf || !buf.length || buf.length > IMAGE_MAX_BYTES) return json(res, 400, { error: 'bad image data' }, origin);
+      const safeName = String(name || 'image').replace(/[^A-Za-z0-9_.-]/g, '_').slice(0, 60);
+      const key = `${S3_PREFIX}${Date.now()}-${crypto.randomBytes(6).toString('hex')}-${safeName}.${ext}`.replace(new RegExp(`\\.${ext}\\.${ext}$`), `.${ext}`);
+      await s3.send(new PutObjectCommand({ Bucket: S3_BUCKET, Key: key, Body: buf, ContentType: type }));
+      return json(res, 200, { key }, origin);
     }
 
     if (req.method === 'POST' && url.pathname === '/notes') {
-      const { text } = await readBody(req);
-      if (!text || !String(text).trim()) return json(res, 400, { error: 'text required' }, origin);
+      const { text, images } = await readBody(req);
+      const imgs = sanitizeImageKeys(images);
+      if ((!text || !String(text).trim()) && !imgs.length) return json(res, 400, { error: 'text required' }, origin);
       const note = {
         id: crypto.randomBytes(8).toString('hex'),
         author: auth.email,
-        text: String(text).trim().slice(0, 4000),
+        text: String(text || '').trim().slice(0, 4000),
+        images: imgs,
         created_at: new Date().toISOString(),
         status: 'open',
         status_by: null,
@@ -204,9 +251,10 @@ const server = http.createServer(async (req, res) => {
 
     const replyMatch = url.pathname.match(/^\/notes\/([a-f0-9]{16})\/reply$/);
     if (req.method === 'POST' && replyMatch) {
-      const { text } = await readBody(req);
-      if (!text || !String(text).trim()) return json(res, 400, { error: 'text required' }, origin);
-      const reply = { author: auth.email, text: String(text).trim().slice(0, 4000), at: new Date().toISOString() };
+      const { text, images } = await readBody(req);
+      const imgs = sanitizeImageKeys(images);
+      if ((!text || !String(text).trim()) && !imgs.length) return json(res, 400, { error: 'text required' }, origin);
+      const reply = { author: auth.email, text: String(text || '').trim().slice(0, 4000), images: imgs, at: new Date().toISOString() };
       const ok = writeNotes(notes => {
         const n = notes.find(x => x.id === replyMatch[1]);
         if (!n) return false;

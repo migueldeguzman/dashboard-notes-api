@@ -1,6 +1,14 @@
 {
   "name": "dashboard-notes-api",
   "private": true,
-  "engines": { "node": ">=18" },
-  "scripts": { "start": "node server.js" }
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.1100.0",
+    "@aws-sdk/s3-request-presigner": "^3.1100.0"
+  }
 }
