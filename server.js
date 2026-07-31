@@ -99,10 +99,10 @@ function json(res, code, obj, origin) {
   res.end(JSON.stringify(obj));
 }
 
-function readBody(req) {
+function readBody(req, maxBytes = 100000) {
   return new Promise((resolve, reject) => {
     let d = '';
-    req.on('data', c => { d += c; if (d.length > 100000) req.destroy(); });
+    req.on('data', c => { d += c; if (d.length > maxBytes) req.destroy(); });
     req.on('end', () => { try { resolve(d ? JSON.parse(d) : {}); } catch (e) { reject(e); } });
   });
 }
@@ -115,6 +115,11 @@ const VALID_STATUS = ['open', 'done', 'deployed'];
 const PUBLISH_SECRET = process.env.PUBLISH_SECRET || '';
 let feedCache = null;
 try { feedCache = JSON.parse(fs.readFileSync('/tmp/feed.json', 'utf8')); } catch {}
+// Work-logs channel: same pass-through pattern as /feed but with a larger
+// body allowance - the envelope carries whole (encrypted) session transcripts.
+const LOGS_MAX_BYTES = 20 * 1024 * 1024;
+let logsCache = null;
+try { logsCache = JSON.parse(fs.readFileSync('/tmp/logs.json', 'utf8')); } catch {}
 
 const server = http.createServer(async (req, res) => {
   const origin = req.headers.origin;
@@ -139,6 +144,25 @@ const server = http.createServer(async (req, res) => {
         }
         feedCache = await readBody(req);
         try { fs.writeFileSync('/tmp/feed.json', JSON.stringify(feedCache)); } catch {}
+        return json(res, 200, { ok: true }, origin);
+      }
+    }
+
+    if (url.pathname === '/logs') {
+      if (req.method === 'GET') {
+        res.writeHead(logsCache ? 200 : 404, {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*',
+          'Cache-Control': 'no-store',
+        });
+        return res.end(logsCache ? JSON.stringify(logsCache) : '{"error":"no logs yet"}');
+      }
+      if (req.method === 'POST') {
+        if (!PUBLISH_SECRET || req.headers['x-publish-secret'] !== PUBLISH_SECRET) {
+          return json(res, 401, { error: 'unauthorized' }, origin);
+        }
+        logsCache = await readBody(req, LOGS_MAX_BYTES);
+        try { fs.writeFileSync('/tmp/logs.json', JSON.stringify(logsCache)); } catch {}
         return json(res, 200, { ok: true }, origin);
       }
     }
