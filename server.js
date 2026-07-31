@@ -109,6 +109,13 @@ function readBody(req) {
 
 const VALID_STATUS = ['open', 'done', 'deployed'];
 
+// Live feed pass-through: the workstation publisher POSTs the encrypted
+// envelope here; the dashboard GETs it with zero CDN caching. The envelope is
+// ciphertext, so the GET can be public (same data as the public git branch).
+const PUBLISH_SECRET = process.env.PUBLISH_SECRET || '';
+let feedCache = null;
+try { feedCache = JSON.parse(fs.readFileSync('/tmp/feed.json', 'utf8')); } catch {}
+
 const server = http.createServer(async (req, res) => {
   const origin = req.headers.origin;
   if (req.method === 'OPTIONS') return json(res, 204, {}, origin);
@@ -116,6 +123,25 @@ const server = http.createServer(async (req, res) => {
 
   try {
     if (req.method === 'GET' && url.pathname === '/health') return json(res, 200, { ok: true }, origin);
+
+    if (url.pathname === '/feed') {
+      if (req.method === 'GET') {
+        res.writeHead(feedCache ? 200 : 404, {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*',
+          'Cache-Control': 'no-store',
+        });
+        return res.end(feedCache ? JSON.stringify(feedCache) : '{"error":"no feed yet"}');
+      }
+      if (req.method === 'POST') {
+        if (!PUBLISH_SECRET || req.headers['x-publish-secret'] !== PUBLISH_SECRET) {
+          return json(res, 401, { error: 'unauthorized' }, origin);
+        }
+        feedCache = await readBody(req);
+        try { fs.writeFileSync('/tmp/feed.json', JSON.stringify(feedCache)); } catch {}
+        return json(res, 200, { ok: true }, origin);
+      }
+    }
 
     if (req.method === 'POST' && url.pathname === '/login') {
       const { email, password } = await readBody(req);
